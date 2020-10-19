@@ -52,7 +52,7 @@ struct SetLookupState : public KernelState {
       uint32_t index = 0;
       auto search = [&](const T& key) -> bool {
         for(uint32_t i = 0; i < vector->size(); ++i) {
-          if((*vector)[i] == key) {
+          if((*vector)[i].first == key) {
             return true;
           }
         }
@@ -60,7 +60,7 @@ struct SetLookupState : public KernelState {
       };
       auto visit_valid = [&](T v) {
         if(!search(v)) {
-          vector->push_back(v);
+          vector->push_back({v, index});
           ++index;
         }
         return Status::OK();
@@ -120,7 +120,7 @@ struct SetLookupState : public KernelState {
   }
 
   using MemoTable = typename HashTraits<Type>::MemoTableType;
-  using Vector = std::vector<typename GetViewType<Type>::T>;
+  using Vector = std::vector<std::pair<typename GetViewType<Type>::T, int32_t>>;
 
   MemoryPool* memoryPool;
   util::variant<std::shared_ptr<MemoTable>, std::shared_ptr<Vector>> lookup_container;
@@ -284,8 +284,8 @@ struct IndexInVisitor {
       auto search = [&](const T& key) -> int32_t {
         for(uint32_t i = 0; i < vector->size(); ++i)
         {
-          if((*vector)[i] == key)
-            return (int32_t)i;
+          if((*vector)[i].first == key)
+            return (*vector)[i].second;
         }
         return -1;
       };
@@ -434,8 +434,8 @@ struct IsInVisitor {
       auto search = [&](const T& key) -> int32_t {
         for(uint32_t i = 0; i < vector->size(); ++i)
         {
-          if((*vector)[i] == key)
-            return (int32_t)i;
+          if((*vector)[i].first == key)
+            return (*vector)[i].second;
         }
         return -1;
       };
@@ -522,7 +522,8 @@ void AddBasicSetLookupKernels(ScalarKernel kernel,
 // Enables calling is_in with CallFunction as though it were binary.
 class IsInMetaBinary : public MetaFunction {
  public:
-  IsInMetaBinary() : MetaFunction("is_in_meta_binary", Arity::Binary()) {}
+  IsInMetaBinary()
+      : MetaFunction("is_in_meta_binary", Arity::Binary(), /*doc=*/nullptr) {}
 
   Result<Datum> ExecuteImpl(const std::vector<Datum>& args,
                             const FunctionOptions* options,
@@ -537,7 +538,8 @@ class IsInMetaBinary : public MetaFunction {
 // Enables calling index_in with CallFunction as though it were binary.
 class IndexInMetaBinary : public MetaFunction {
  public:
-  IndexInMetaBinary() : MetaFunction("index_in_meta_binary", Arity::Binary()) {}
+  IndexInMetaBinary()
+      : MetaFunction("index_in_meta_binary", Arity::Binary(), /*doc=*/nullptr) {}
 
   Result<Datum> ExecuteImpl(const std::vector<Datum>& args,
                             const FunctionOptions* options,
@@ -549,6 +551,22 @@ class IndexInMetaBinary : public MetaFunction {
   }
 };
 
+const FunctionDoc is_in_doc{
+    "Find each element in a set of values",
+    ("For each element in `values`, return true if it is found in a given\n"
+     "set of values.  The set of values to look for must be given in\n"
+     "SetLookupOptions."),
+    {"values"},
+    "SetLookupOptions"};
+
+const FunctionDoc index_in_doc{
+    "Return index of each element in a set of values",
+    ("For each element in `values`, return its index in a given set of\n"
+     "values, or null if it is not found there.\n"
+     "The set of values to look for must be given in SetLookupOptions."),
+    {"values"},
+    "SetLookupOptions"};
+
 }  // namespace
 
 void RegisterScalarSetLookup(FunctionRegistry* registry) {
@@ -557,7 +575,7 @@ void RegisterScalarSetLookup(FunctionRegistry* registry) {
     ScalarKernel isin_base;
     isin_base.init = InitSetLookup;
     isin_base.exec = ExecIsIn;
-    auto is_in = std::make_shared<ScalarFunction>("is_in", Arity::Unary());
+    auto is_in = std::make_shared<ScalarFunction>("is_in", Arity::Unary(), &is_in_doc);
 
     AddBasicSetLookupKernels(isin_base, /*output_type=*/boolean(), is_in.get());
 
@@ -576,7 +594,8 @@ void RegisterScalarSetLookup(FunctionRegistry* registry) {
     index_in_base.exec = ExecIndexIn;
     index_in_base.null_handling = NullHandling::COMPUTED_NO_PREALLOCATE;
     index_in_base.mem_allocation = MemAllocation::NO_PREALLOCATE;
-    auto index_in = std::make_shared<ScalarFunction>("index_in", Arity::Unary());
+    auto index_in =
+        std::make_shared<ScalarFunction>("index_in", Arity::Unary(), &index_in_doc);
 
     AddBasicSetLookupKernels(index_in_base, /*output_type=*/int32(), index_in.get());
 
