@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <vector>
-#include <memory>
-
 #include "arrow/array/array_base.h"
 #include "arrow/array/builder_primitive.h"
 #include "arrow/compute/api_scalar.h"
@@ -26,7 +23,6 @@
 #include "arrow/util/bitmap_writer.h"
 #include "arrow/util/hashing.h"
 #include "arrow/util/optional.h"
-#include "arrow/util/variant.h"  // IWYU pragma: export
 #include "arrow/visitor_inline.h"
 
 namespace arrow {
@@ -41,89 +37,38 @@ namespace {
 template <typename Type>
 struct SetLookupState : public KernelState {
   explicit SetLookupState(MemoryPool* pool)
-      : memoryPool(pool), lookup_null_count(0) {}
+      : lookup_table(pool, 0), lookup_null_count(0) {}
 
   Status Init(const SetLookupOptions& options) {
     using T = typename GetViewType<Type>::T;
-    if (options.value_set.length() < 512)
-    {
-      lookup_container = std::move(std::shared_ptr<Vector>(new Vector()));
-      std::shared_ptr<Vector> vector = util::get<std::shared_ptr<Vector>>(lookup_container);
-      uint32_t index = 0;
-      auto search = [&](const T& key) -> bool {
-        for(uint32_t i = 0; i < vector->size(); ++i) {
-          if((*vector)[i].first == key) {
-            return true;
-          }
-        }
-        return false;
-      };
-      auto visit_valid = [&](T v) {
-        if(!search(v)) {
-          vector->push_back({v, index});
-          ++index;
-        }
-        return Status::OK();
-      };
-      auto visit_null = [&]() {
-        if (!options.skip_nulls) {
-          if (null_index == -1) {
-            null_index = index;
-            ++index;
-          }
-        }
-        return Status::OK();
-      };
-      if (options.value_set.kind() == Datum::ARRAY) {
-        const std::shared_ptr<ArrayData>& value_set = options.value_set.array();
-        this->lookup_null_count += value_set->GetNullCount();
-        return VisitArrayDataInline<Type>(*value_set, std::move(visit_valid),
-                                          std::move(visit_null));
-      } else {
-        const ChunkedArray& value_set = *options.value_set.chunked_array();
-        for (const std::shared_ptr<Array>& chunk : value_set.chunks()) {
-          this->lookup_null_count += chunk->null_count();
-          RETURN_NOT_OK(VisitArrayDataInline<Type>(*chunk->data(), std::move(visit_valid),
-                                                  std::move(visit_null)));
-        }
+    auto visit_valid = [&](T v) {
+      int32_t unused_memo_index;
+      return lookup_table.GetOrInsert(v, &unused_memo_index);
+    };
+    auto visit_null = [&]() {
+      if (!options.skip_nulls) {
+        lookup_table.GetOrInsertNull();
       }
-    }
-    else
-    {
-      lookup_container = std::move(std::shared_ptr<MemoTable>(new MemoTable(memoryPool, 0)));
-      std::shared_ptr<MemoTable> lookup_table = util::get<std::shared_ptr<MemoTable>>(lookup_container);
-      auto visit_valid = [&](T v) {
-        int32_t unused_memo_index;
-        return lookup_table->GetOrInsert(v, &unused_memo_index);
-      };
-      auto visit_null = [&]() {
-        if (!options.skip_nulls) {
-          lookup_table->GetOrInsertNull();
-        }
-        return Status::OK();
-      };
-      if (options.value_set.kind() == Datum::ARRAY) {
-        const std::shared_ptr<ArrayData>& value_set = options.value_set.array();
-        this->lookup_null_count += value_set->GetNullCount();
-        return VisitArrayDataInline<Type>(*value_set, std::move(visit_valid),
-                                          std::move(visit_null));
-      } else {
-        const ChunkedArray& value_set = *options.value_set.chunked_array();
-        for (const std::shared_ptr<Array>& chunk : value_set.chunks()) {
-          this->lookup_null_count += chunk->null_count();
-          RETURN_NOT_OK(VisitArrayDataInline<Type>(*chunk->data(), std::move(visit_valid),
-                                                  std::move(visit_null)));
-        }
+      return Status::OK();
+    };
+    if (options.value_set.kind() == Datum::ARRAY) {
+      const std::shared_ptr<ArrayData>& value_set = options.value_set.array();
+      this->lookup_null_count += value_set->GetNullCount();
+      return VisitArrayDataInline<Type>(*value_set, std::move(visit_valid),
+                                        std::move(visit_null));
+    } else {
+      const ChunkedArray& value_set = *options.value_set.chunked_array();
+      for (const std::shared_ptr<Array>& chunk : value_set.chunks()) {
+        this->lookup_null_count += chunk->null_count();
+        RETURN_NOT_OK(VisitArrayDataInline<Type>(*chunk->data(), std::move(visit_valid),
+                                                 std::move(visit_null)));
       }
+      return Status::OK();
     }
-    return Status::OK();
   }
 
   using MemoTable = typename HashTraits<Type>::MemoTableType;
-  using Vector = std::vector<std::pair<typename GetViewType<Type>::T, int32_t>>;
-
-  MemoryPool* memoryPool;
-  util::variant<std::shared_ptr<MemoTable>, std::shared_ptr<Vector>> lookup_container;
+  MemoTable lookup_table;
   int64_t lookup_null_count;
   int64_t null_index = -1;
 };
@@ -249,68 +194,30 @@ struct IndexInVisitor {
     using T = typename GetViewType<Type>::T;
 
     const auto& state = checked_cast<const SetLookupState<Type>&>(*ctx->state());
-    auto lookup_table = util::get_if<std::shared_ptr<typename SetLookupState<Type>::MemoTable>>(&state.lookup_container);
-    if(lookup_table != nullptr)
-    {
-      int32_t null_index = (*lookup_table)->GetNull();
-      RETURN_NOT_OK(this->builder.Reserve(data.length));
-      VisitArrayDataInline<Type>(
-          data,
-          [&](T v) {
-            int32_t index = (*lookup_table)->Get(v);
-            if (index != -1) {
-              // matching needle; output index from value_set
-              this->builder.UnsafeAppend(index);
-            } else {
-              // no matching needle; output null
-              this->builder.UnsafeAppendNull();
-            }
-          },
-          [&]() {
-            if (null_index != -1) {
-              // value_set included null
-              this->builder.UnsafeAppend(null_index);
-            } else {
-              // value_set does not include null; output null
-              this->builder.UnsafeAppendNull();
-            }
-          });
-    }
-    else
-    {
-      auto vector = util::get<std::shared_ptr<typename SetLookupState<Type>::Vector>>(state.lookup_container);
-      int32_t null_index = state.null_index;
-      RETURN_NOT_OK(this->builder.Reserve(data.length));
-      auto search = [&](const T& key) -> int32_t {
-        for(uint32_t i = 0; i < vector->size(); ++i)
-        {
-          if((*vector)[i].first == key)
-            return (*vector)[i].second;
-        }
-        return -1;
-      };
-      VisitArrayDataInline<Type>(
-          data,
-          [&](T v) {
-            int32_t index = search(v);
-            if (index != -1) {
-              // matching needle; output index from value_set
-              this->builder.UnsafeAppend(index);
-            } else {
-              // no matching needle; output null
-              this->builder.UnsafeAppendNull();
-            }
-          },
-          [&]() {
-            if (null_index != -1) {
-              // value_set included null
-              this->builder.UnsafeAppend(null_index);
-            } else {
-              // value_set does not include null; output null
-              this->builder.UnsafeAppendNull();
-            }
-          });     
-    }
+
+    int32_t null_index = state.lookup_table.GetNull();
+    RETURN_NOT_OK(this->builder.Reserve(data.length));
+    VisitArrayDataInline<Type>(
+        data,
+        [&](T v) {
+          int32_t index = state.lookup_table.Get(v);
+          if (index != -1) {
+            // matching needle; output index from value_set
+            this->builder.UnsafeAppend(index);
+          } else {
+            // no matching needle; output null
+            this->builder.UnsafeAppendNull();
+          }
+        },
+        [&]() {
+          if (null_index != -1) {
+            // value_set included null
+            this->builder.UnsafeAppend(null_index);
+          } else {
+            // value_set does not include null; output null
+            this->builder.UnsafeAppendNull();
+          }
+        });
     return Status::OK();
   }
 
@@ -410,50 +317,20 @@ struct IsInVisitor {
     }
     FirstTimeBitmapWriter writer(output->buffers[1]->mutable_data(), output->offset,
                                  output->length);
-    auto lookup_table = util::get_if<std::shared_ptr<typename SetLookupState<Type>::MemoTable>>(&state.lookup_container);
-    if(lookup_table != nullptr)
-    {
-      VisitArrayDataInline<Type>(
-          this->data,
-          [&](T v) {
-            if ((*lookup_table)->Get(v) != -1) {
-              writer.Set();
-            } else {
-              writer.Clear();
-            }
-            writer.Next();
-          },
-          [&]() {
+    VisitArrayDataInline<Type>(
+        this->data,
+        [&](T v) {
+          if (state.lookup_table.Get(v) != -1) {
             writer.Set();
-            writer.Next();
-          });
-    }
-    else
-    {
-      auto vector = util::get<std::shared_ptr<typename SetLookupState<Type>::Vector>>(state.lookup_container);
-      auto search = [&](const T& key) -> int32_t {
-        for(uint32_t i = 0; i < vector->size(); ++i)
-        {
-          if((*vector)[i].first == key)
-            return (*vector)[i].second;
-        }
-        return -1;
-      };
-      VisitArrayDataInline<Type>(
-          this->data,
-          [&](T v) {
-            if (search(v) != -1) {
-              writer.Set();
-            } else {
-              writer.Clear();
-            }
-            writer.Next();
-          },
-          [&]() {
-            writer.Set();
-            writer.Next();
-          });
-    }    
+          } else {
+            writer.Clear();
+          }
+          writer.Next();
+        },
+        [&]() {
+          writer.Set();
+          writer.Next();
+        });
     writer.Finish();
     return Status::OK();
   }
